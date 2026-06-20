@@ -5,10 +5,12 @@ build/
 dist/
 wheels/
 *.egg-info
+.pgadmin/
 
 # Virtual environments
 .venv
+.env
 
 # Data files
 Data/
-pdfs/
+temp/
