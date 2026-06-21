@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from pathlib import Path
 
@@ -11,7 +10,13 @@ from rich.table import Table
 
 from .config import CFG
 from .generate import generate_answer
-from .metrics import compute_ragas_metrics, percentiles, render_latency, render_ragas_metrics
+from .metrics import (
+    compute_ragas_metrics,
+    percentiles,
+    render_latency,
+    render_ragas_metrics,
+    retrieval_metrics,
+)
 from .models import GoldenItem, LatencyRecord
 from .retrieve import hybrid_search
 
@@ -33,31 +38,9 @@ def load_golden(path: Path | str) -> list[GoldenItem]:
                 question=r["question"],
                 gold_doc_ids=list(r.get("gold_doc_ids") or []),
                 gold_answer=r.get("gold_answer"),
+                reference_contexts=list(r.get("reference_contexts") or []),
             ))
     return items
-
-
-def _retrieval_metrics(retrieved_doc_ids: list[str], gold: list[str], k: int) -> dict[str, float]:
-    """Hit@1, Recall@k, MRR@k, nDCG@k. Gold treated as relevant set."""
-    gold_set = set(gold)
-    topk = retrieved_doc_ids[:k]
-    if not gold_set:
-        return {"hit@1": 0.0, "recall@k": 0.0, "mrr@k": 0.0, "ndcg@k": 0.0}
-
-    hit_at_1 = 1.0 if topk and topk[0] in gold_set else 0.0
-    recalled = len(gold_set.intersection(topk))
-    recall = recalled / len(gold_set)
-
-    mrr = 0.0
-    for i, d in enumerate(topk, 1):
-        if d in gold_set:
-            mrr = 1.0 / i
-            break
-
-    dcg = sum((1.0 / math.log2(i + 1)) for i, d in enumerate(topk, 1) if d in gold_set)
-    ideal = sum((1.0 / math.log2(i + 1)) for i in range(1, min(len(gold_set), k) + 1))
-    ndcg = dcg / ideal if ideal > 0 else 0.0
-    return {"hit@1": hit_at_1, "recall@k": recall, "mrr@k": mrr, "ndcg@k": ndcg}
 
 
 def run_evaluation(*, golden_path: Path | str | None = None,
@@ -90,8 +73,14 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     for item in items:
         rec = LatencyRecord(command="/evaluate.query")
         hits = hybrid_search(item.question, k=k, rec=rec)
-        retrieved_docs = [h.doc_id for h in hits]
-        m = _retrieval_metrics(retrieved_docs, item.gold_doc_ids, k)
+        # Dedupe at doc level (keep first occurrence) — multiple chunks from
+        # the same paper would otherwise inflate nDCG past 1.0.
+        seen, retrieved_docs = set(), []
+        for h in hits:
+            if h.doc_id not in seen:
+                seen.add(h.doc_id)
+                retrieved_docs.append(h.doc_id)
+        m = retrieval_metrics(retrieved_docs, item.gold_doc_ids, k)
         for key, val in m.items():
             metrics_acc[key].append(val)
 
@@ -109,6 +98,7 @@ def run_evaluation(*, golden_path: Path | str | None = None,
                 "answer": ans_text,
                 "contexts": [h.content for h in hits],
                 "ground_truth": item.gold_answer,
+                "reference_contexts": item.reference_contexts,
             })
 
         for s in rec.stages:

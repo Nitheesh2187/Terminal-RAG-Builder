@@ -61,3 +61,4 @@ class GoldenItem:
     question: str
     gold_doc_ids: list[str]
     gold_answer: str | None = None
+    reference_contexts: list[str] = field(default_factory=list)

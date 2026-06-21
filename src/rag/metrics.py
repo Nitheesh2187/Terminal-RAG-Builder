@@ -1,6 +1,7 @@
-"""Latency tracking + Ragas metric computation + Rich rendering."""
+"""Latency tracking + retrieval metrics + Ragas metric computation + Rich rendering."""
 from __future__ import annotations
 
+import math
 import statistics
 import time
 from contextlib import contextmanager
@@ -13,6 +14,36 @@ from .config import CFG
 from .models import LatencyRecord
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Classical retrieval metrics (doc-id based, no LLM, deterministic)
+# ---------------------------------------------------------------------------
+
+def retrieval_metrics(retrieved_doc_ids: list[str], gold: list[str], k: int) -> dict[str, float]:
+    """Hit@1, Recall@k, MRR@k, nDCG@k. Gold treated as the binary-relevant set.
+
+    Caller is responsible for deduping `retrieved_doc_ids` if doc-level
+    metrics are intended — duplicates inflate nDCG above 1.0.
+    """
+    gold_set = set(gold)
+    topk = retrieved_doc_ids[:k]
+    if not gold_set:
+        return {"hit@1": 0.0, "recall@k": 0.0, "mrr@k": 0.0, "ndcg@k": 0.0}
+
+    hit_at_1 = 1.0 if topk and topk[0] in gold_set else 0.0
+    recall = len(gold_set.intersection(topk)) / len(gold_set)
+
+    mrr = 0.0
+    for i, d in enumerate(topk, 1):
+        if d in gold_set:
+            mrr = 1.0 / i
+            break
+
+    dcg = sum((1.0 / math.log2(i + 1)) for i, d in enumerate(topk, 1) if d in gold_set)
+    ideal = sum((1.0 / math.log2(i + 1)) for i in range(1, min(len(gold_set), k) + 1))
+    ndcg = dcg / ideal if ideal > 0 else 0.0
+    return {"hit@1": hit_at_1, "recall@k": recall, "mrr@k": mrr, "ndcg@k": ndcg}
 
 
 @contextmanager
@@ -88,11 +119,13 @@ def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
     """Compute Ragas metrics on a list of per-query samples.
 
     Each sample is:
-        {question, answer, contexts: list[str], ground_truth: str | None}
+        {question, answer, contexts, ground_truth?, reference_contexts?}
 
-    Metrics auto-selected by availability:
-      - faithfulness, answer_relevancy:   always (need q, a, contexts)
-      - context_precision, context_recall: only when any ground_truth is present
+    Metrics auto-selected by what's available:
+      - faithfulness, answer_relevancy:                       always (need q, a, contexts)
+      - context_precision, context_recall (LLM-judged):       when any ground_truth is present
+      - non_llm_context_precision, non_llm_context_recall:    when any reference_contexts present
+        (string-similarity based — deterministic, no LLM calls, no rate limits)
     """
     if not samples:
         return {}
@@ -106,9 +139,29 @@ def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
     )
 
     any_gt = any(s.get("ground_truth") for s in samples)
+    any_ref_ctx = any(s.get("reference_contexts") for s in samples)
+
     metrics = [faithfulness, answer_relevancy]
     if any_gt:
         metrics += [context_precision, context_recall]
+
+    if any_ref_ctx:
+        # Non-LLM variants — string-similarity, no rate-limit pressure.
+        # Import lazily so older Ragas installs don't break the whole module.
+        try:
+            from ragas.metrics import (
+                NonLLMContextPrecisionWithReference,
+                NonLLMContextRecall,
+            )
+            metrics += [
+                NonLLMContextPrecisionWithReference(),
+                NonLLMContextRecall(),
+            ]
+        except ImportError:
+            console.print(
+                "[yellow]warn[/yellow]: non-LLM context metrics unavailable "
+                "in this ragas version — install ragas>=0.2.10"
+            )
 
     rows = []
     for s in samples:
@@ -117,9 +170,10 @@ def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
             "response": s["answer"],
             "retrieved_contexts": list(s.get("contexts") or []),
         }
-        gt = s.get("ground_truth")
         if any_gt:
-            row["reference"] = gt or ""
+            row["reference"] = s.get("ground_truth") or ""
+        if any_ref_ctx:
+            row["reference_contexts"] = list(s.get("reference_contexts") or [])
         rows.append(row)
 
     ds = Dataset.from_list(rows)

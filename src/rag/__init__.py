@@ -22,4 +22,15 @@ if _os.environ.get("EMBED_DEVICE", "cpu").lower() == "cuda":
 else:
     _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+# Flip HuggingFace to offline mode once the embed model is cached on disk.
+# Without this, sentence-transformers makes a metadata HEAD request to
+# huggingface.co on EVERY model load — slow at best, fatal when offline.
+# First-time runs still hit the network (cache miss), then go offline forever.
+_embed_model = _os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+_hf_home = _Path(_os.environ.get("HF_HOME", _Path.home() / ".cache" / "huggingface"))
+_model_cache = _hf_home / "hub" / f"models--{_embed_model.replace('/', '--')}"
+if _model_cache.exists():
+    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 __version__ = "0.1.0"
