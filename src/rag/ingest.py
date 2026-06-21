@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
-import fitz  # PyMuPDF
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -17,9 +15,19 @@ from rich.progress import (
 
 from .chunking import chunk_text
 from .config import CFG
-from .db import connect, counts, init_schema, reset_schema
+from .db import (
+    connect,
+    counts,
+    existing_doc_ids,
+    init_schema,
+    insert_chunks,
+    reset_schema,
+    upsert_document,
+)
 from .embed import embed_texts
-from .metrics import LatencyRecord, render_latency, stage
+from .metrics import render_latency, stage
+from .models import LatencyRecord
+from .pdf import pdf_to_text
 
 console = Console()
 
@@ -47,60 +55,6 @@ def _load_metadata_index() -> dict[str, dict]:
     return out
 
 
-def _pdf_to_text(path: Path) -> str:
-    with fitz.open(path) as doc:
-        return "\n".join(page.get_text("text") for page in doc)
-
-
-def _existing_doc_ids() -> set[str]:
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT doc_id FROM documents;")
-        return {r[0] for r in cur.fetchall()}
-
-
-def _upsert_document(conn, doc_id: str, pdf_path: str, meta: dict, n_chunks: int) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO documents (doc_id, title, authors, categories, year, abstract, pdf_path, n_chunks)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (doc_id) DO UPDATE
-              SET title = EXCLUDED.title,
-                  authors = EXCLUDED.authors,
-                  categories = EXCLUDED.categories,
-                  year = EXCLUDED.year,
-                  abstract = EXCLUDED.abstract,
-                  pdf_path = EXCLUDED.pdf_path,
-                  n_chunks = EXCLUDED.n_chunks,
-                  ingested_at = NOW();
-            """,
-            (
-                doc_id,
-                meta.get("title"),
-                meta.get("authors"),
-                meta.get("categories"),
-                meta.get("year"),
-                meta.get("abstract"),
-                pdf_path,
-                n_chunks,
-            ),
-        )
-
-
-def _insert_chunks(conn, doc_id: str, chunks, embeddings) -> None:
-    with conn.cursor() as cur:
-        cur.execute("DELETE FROM chunks WHERE doc_id = %s;", (doc_id,))
-        rows = [
-            (doc_id, c.idx, c.text, c.n_tokens, embeddings[i])
-            for i, c in enumerate(chunks)
-        ]
-        cur.executemany(
-            "INSERT INTO chunks (doc_id, chunk_idx, content, n_tokens, embedding)"
-            " VALUES (%s, %s, %s, %s, %s);",
-            rows,
-        )
-
-
 def run_ingest(*, limit: int | None = None, reset: bool = False) -> LatencyRecord:
     rec = LatencyRecord(command="/ingest")
     if reset:
@@ -115,7 +69,7 @@ def run_ingest(*, limit: int | None = None, reset: bool = False) -> LatencyRecor
     if limit is not None:
         pdf_paths = pdf_paths[:limit]
 
-    skip = _existing_doc_ids() if not reset else set()
+    skip = existing_doc_ids() if not reset else set()
     pending = [p for p in pdf_paths if p.stem.replace("_", "/") not in skip and p.stem not in skip]
 
     console.print(
@@ -149,7 +103,7 @@ def run_ingest(*, limit: int | None = None, reset: bool = False) -> LatencyRecor
                 meta = meta_index.get(doc_id, {})
                 try:
                     t0 = time.perf_counter()
-                    text = _pdf_to_text(pdf)
+                    text = pdf_to_text(pdf)
                     parse_ms += (time.perf_counter() - t0) * 1000
 
                     t0 = time.perf_counter()
@@ -167,8 +121,8 @@ def run_ingest(*, limit: int | None = None, reset: bool = False) -> LatencyRecor
                     embed_ms += (time.perf_counter() - t0) * 1000
 
                     t0 = time.perf_counter()
-                    _upsert_document(conn, doc_id, str(pdf.relative_to(CFG.root)), meta, len(chunks))
-                    _insert_chunks(conn, doc_id, chunks, vecs)
+                    upsert_document(conn, doc_id, str(pdf.relative_to(CFG.root)), meta, len(chunks))
+                    insert_chunks(conn, doc_id, chunks, vecs)
                     conn.commit()
                     upsert_ms += (time.perf_counter() - t0) * 1000
 

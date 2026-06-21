@@ -16,6 +16,13 @@ dependencies = [
     "rich>=13.7",
     "tqdm>=4.66",
     "tiktoken>=0.7",
+    "ragas>=0.2.10,<0.3",
+    "rapidfuzz>=3.0",
+    "datasets>=2.20,<4.0",
+    "langchain>=0.3,<1.0",
+    "langchain-openai>=0.2,<1.0",
+    "langchain-huggingface>=0.1,<1.0",
+    "langchain-community>=0.3,<0.4",
 ]
 
 [project.scripts]

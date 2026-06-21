@@ -1,14 +1,13 @@
 """Answer generation via Groq (OpenAI-compatible API)."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import lru_cache
 
 from openai import OpenAI
 
 from .config import CFG
-from .metrics import LatencyRecord, stage
-from .retrieve import Hit
+from .metrics import stage
+from .models import Answer, Hit, LatencyRecord
 
 SYSTEM_PROMPT = (
     "You are a research assistant answering questions strictly from the provided arXiv excerpts. "
@@ -32,14 +31,6 @@ def _format_context(hits: list[Hit]) -> str:
         head = f"[{i}] {h.doc_id}" + (f" — {h.title}" if h.title else "")
         blocks.append(f"{head}\n{h.content.strip()}")
     return "\n\n".join(blocks)
-
-
-@dataclass
-class Answer:
-    text: str
-    model: str
-    prompt_tokens: int | None
-    completion_tokens: int | None
 
 
 def generate_answer(query: str, hits: list[Hit], *, rec: LatencyRecord) -> Answer:

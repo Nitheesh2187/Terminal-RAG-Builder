@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import math
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from rich.console import Console
@@ -12,17 +11,11 @@ from rich.table import Table
 
 from .config import CFG
 from .generate import generate_answer
-from .metrics import LatencyRecord, percentiles, render_latency
+from .metrics import compute_ragas_metrics, percentiles, render_latency, render_ragas_metrics
+from .models import GoldenItem, LatencyRecord
 from .retrieve import hybrid_search
 
 console = Console()
-
-
-@dataclass
-class GoldenItem:
-    question: str
-    gold_doc_ids: list[str]
-    gold_answer: str | None = None
 
 
 def load_golden(path: Path | str) -> list[GoldenItem]:
@@ -69,7 +62,8 @@ def _retrieval_metrics(retrieved_doc_ids: list[str], gold: list[str], k: int) ->
 
 def run_evaluation(*, golden_path: Path | str | None = None,
                    k: int | None = None,
-                   with_generation: bool = False) -> dict:
+                   with_generation: bool = False,
+                   with_ragas: bool = False) -> dict:
     golden_path = Path(golden_path or CFG.golden_path)
     k = k or CFG.top_k
     items = load_golden(golden_path)
@@ -77,12 +71,21 @@ def run_evaluation(*, golden_path: Path | str | None = None,
         console.print("[yellow]golden set is empty[/yellow]")
         return {}
 
+    # Ragas needs generated answers
+    if with_ragas and not with_generation:
+        console.print("[dim]--ragas implies generation; enabling[/dim]")
+        with_generation = True
+
     per_query_latencies: dict[str, list[float]] = {
         "embed_query": [], "dense_sql": [], "sparse_sql": [], "rrf_fuse": [], "llm_generate": [], "total": [],
     }
     metrics_acc = {"hit@1": [], "recall@k": [], "mrr@k": [], "ndcg@k": []}
+    ragas_samples: list[dict] = []
 
-    console.print(f"[cyan]evaluate[/cyan]: {len(items)} queries, k={k}, generate={with_generation}")
+    console.print(
+        f"[cyan]evaluate[/cyan]: {len(items)} queries, k={k}, "
+        f"generate={with_generation}, ragas={with_ragas}"
+    )
     t_overall = time.perf_counter()
     for item in items:
         rec = LatencyRecord(command="/evaluate.query")
@@ -92,11 +95,21 @@ def run_evaluation(*, golden_path: Path | str | None = None,
         for key, val in m.items():
             metrics_acc[key].append(val)
 
+        ans_text: str | None = None
         if with_generation:
             try:
-                generate_answer(item.question, hits, rec=rec)
+                ans = generate_answer(item.question, hits, rec=rec)
+                ans_text = ans.text
             except Exception as e:
                 console.print(f"[red]gen fail[/red]: {e}")
+
+        if with_ragas and ans_text is not None:
+            ragas_samples.append({
+                "question": item.question,
+                "answer": ans_text,
+                "contexts": [h.content for h in hits],
+                "ground_truth": item.gold_answer,
+            })
 
         for s in rec.stages:
             per_query_latencies.setdefault(s.name, []).append(s.ms)
@@ -138,9 +151,24 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     summary_rec.set("queries_per_sec", len(items) / wall_s if wall_s > 0 else 0.0)
     render_latency(summary_rec, title="/evaluate — summary")
 
+    ragas_scores: dict[str, float] = {}
+    if with_ragas:
+        if not ragas_samples:
+            console.print("[yellow]ragas: no samples (generation may have failed)[/yellow]")
+        else:
+            console.print(f"[cyan]ragas[/cyan]: scoring {len(ragas_samples)} samples (LLM calls — slow)")
+            t_r = time.perf_counter()
+            try:
+                ragas_scores = compute_ragas_metrics(ragas_samples)
+                console.print(f"[dim]ragas wall: {time.perf_counter() - t_r:.1f}s[/dim]")
+                render_ragas_metrics(ragas_scores)
+            except Exception as e:
+                console.print(f"[red]ragas failed[/red]: {e}")
+
     return {
         "metrics": {k: (sum(v) / len(v) if v else 0.0) for k, v in metrics_acc.items()},
         "latencies_ms": {k: percentiles(v) for k, v in per_query_latencies.items() if v},
+        "ragas": ragas_scores,
         "queries": len(items),
         "wall_seconds": wall_s,
     }

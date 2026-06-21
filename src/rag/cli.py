@@ -1,13 +1,14 @@
 """Terminal REPL for the RAG system.
 
 Commands:
-    /ingest [--limit N] [--reset]   ingest PDFs from PDF_DIR
-    /retrieve <query> [-k 10]       hybrid retrieve only
-    /evaluate [--gen] [-k 10]       run golden eval
-    /stats                          DB counts
-    /help                           show commands
-    /exit                           leave
-    <free text>                     retrieve + generate (RAG answer)
+    /ingest [--limit N] [--reset]                  ingest PDFs from PDF_DIR
+    /retrieve <query> [-k 10]                      hybrid retrieve only
+    /golden -n N [-o path] [--chunks-per-doc 3]    generate synthetic golden set (Ragas)
+    /evaluate [--gen] [--ragas] [-k 10]            run golden eval; --ragas adds Ragas metrics
+    /stats                                         DB counts
+    /help                                          show commands
+    /exit                                          leave
+    <free text>                                    retrieve + generate (RAG answer)
 """
 from __future__ import annotations
 
@@ -25,7 +26,8 @@ from .db import counts, init_schema
 from .evaluate import run_evaluation
 from .generate import generate_answer
 from .ingest import run_ingest
-from .metrics import LatencyRecord, render_latency
+from .metrics import render_latency
+from .models import LatencyRecord
 from .retrieve import hybrid_search, render_hits
 
 console = Console()
@@ -83,6 +85,7 @@ def _cmd_retrieve(args: list[str]) -> None:
 def _cmd_evaluate(args: list[str]) -> None:
     k = CFG.top_k
     with_gen = False
+    with_ragas = False
     golden = None
     i = 0
     while i < len(args):
@@ -91,11 +94,47 @@ def _cmd_evaluate(args: list[str]) -> None:
             k = int(args[i + 1]); i += 2
         elif a == "--gen":
             with_gen = True; i += 1
+        elif a == "--ragas":
+            with_ragas = True; i += 1
         elif a in ("--golden", "-g") and i + 1 < len(args):
             golden = args[i + 1]; i += 2
         else:
             console.print(f"[red]unknown arg[/red]: {a}"); return
-    run_evaluation(golden_path=golden, k=k, with_generation=with_gen)
+    run_evaluation(golden_path=golden, k=k, with_generation=with_gen, with_ragas=with_ragas)
+
+
+def _cmd_golden(args: list[str]) -> None:
+    from pathlib import Path
+
+    from .golden_gen import generate_golden
+
+    count = 50
+    output = None
+    seed = 42
+    chunks_per_doc = 3
+    pdf_sample = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-n", "--count") and i + 1 < len(args):
+            count = int(args[i + 1]); i += 2
+        elif a in ("-o", "--output") and i + 1 < len(args):
+            output = Path(args[i + 1]); i += 2
+        elif a == "--seed" and i + 1 < len(args):
+            seed = int(args[i + 1]); i += 2
+        elif a == "--chunks-per-doc" and i + 1 < len(args):
+            chunks_per_doc = int(args[i + 1]); i += 2
+        elif a == "--pdf-sample" and i + 1 < len(args):
+            pdf_sample = int(args[i + 1]); i += 2
+        else:
+            console.print(f"[red]unknown arg[/red]: {a}"); return
+    generate_golden(
+        count=count,
+        output=output or CFG.golden_path,
+        seed=seed,
+        chunks_per_doc=chunks_per_doc,
+        pdf_sample=pdf_sample,
+    )
 
 
 def _cmd_query(query: str) -> None:
@@ -132,6 +171,8 @@ def _dispatch(line: str) -> bool:
             _cmd_retrieve(args)
         elif cmd == "/evaluate":
             _cmd_evaluate(args)
+        elif cmd == "/golden":
+            _cmd_golden(args)
         else:
             console.print(f"[red]unknown command[/red]: {cmd} (try /help)")
         return True

@@ -1,20 +1,13 @@
 """Token-aware recursive text chunking."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import tiktoken
+
+from .models import Chunk
 
 _ENCODER = tiktoken.get_encoding("cl100k_base")
 
 SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " "]
-
-
-@dataclass
-class Chunk:
-    idx: int
-    text: str
-    n_tokens: int
 
 
 def _split_recursive(text: str, max_toks: int, seps: list[str]) -> list[str]:

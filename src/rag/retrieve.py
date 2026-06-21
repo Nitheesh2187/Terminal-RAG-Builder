@@ -1,64 +1,16 @@
 """Hybrid retrieval: dense (pgvector cosine) + sparse (tsvector ts_rank) fused via RRF."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from rich.console import Console
 from rich.table import Table
 
 from .config import CFG
-from .db import connect
+from .db import connect, dense_search, sparse_search
 from .embed import embed_query
-from .metrics import LatencyRecord, stage
+from .metrics import stage
+from .models import Hit, LatencyRecord
 
 console = Console()
-
-
-@dataclass
-class Hit:
-    chunk_id: int
-    doc_id: str
-    chunk_idx: int
-    content: str
-    title: str | None
-    dense_rank: int | None
-    sparse_rank: int | None
-    dense_score: float | None
-    sparse_score: float | None
-    rrf_score: float
-
-
-def _dense_search(conn, qvec, k: int) -> list[tuple]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT c.id, c.doc_id, c.chunk_idx, c.content, d.title,
-                   1 - (c.embedding <=> %s::vector) AS score
-            FROM chunks c
-            LEFT JOIN documents d ON d.doc_id = c.doc_id
-            ORDER BY c.embedding <=> %s::vector
-            LIMIT %s;
-            """,
-            (qvec, qvec, k),
-        )
-        return cur.fetchall()
-
-
-def _sparse_search(conn, query: str, k: int) -> list[tuple]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT c.id, c.doc_id, c.chunk_idx, c.content, d.title,
-                   ts_rank(c.tsv, plainto_tsquery('english', %s)) AS score
-            FROM chunks c
-            LEFT JOIN documents d ON d.doc_id = c.doc_id
-            WHERE c.tsv @@ plainto_tsquery('english', %s)
-            ORDER BY score DESC
-            LIMIT %s;
-            """,
-            (query, query, k),
-        )
-        return cur.fetchall()
 
 
 def hybrid_search(query: str, *, k: int | None = None, rec: LatencyRecord | None = None) -> list[Hit]:
@@ -72,9 +24,9 @@ def hybrid_search(query: str, *, k: int | None = None, rec: LatencyRecord | None
 
     with connect() as conn:
         with stage(rec, "dense_sql"):
-            dense_rows = _dense_search(conn, qvec, pool_size)
+            dense_rows = dense_search(conn, qvec, pool_size)
         with stage(rec, "sparse_sql"):
-            sparse_rows = _sparse_search(conn, query, pool_size)
+            sparse_rows = sparse_search(conn, query, pool_size)
 
     with stage(rec, "rrf_fuse"):
         dense_rank = {row[0]: i + 1 for i, row in enumerate(dense_rows)}

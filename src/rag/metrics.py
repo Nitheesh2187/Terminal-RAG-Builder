@@ -1,38 +1,18 @@
-"""Latency tracking + Rich rendering for every command."""
+"""Latency tracking + Ragas metric computation + Rich rendering."""
 from __future__ import annotations
 
 import statistics
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from functools import lru_cache
 
 from rich.console import Console
 from rich.table import Table
 
+from .config import CFG
+from .models import LatencyRecord
+
 console = Console()
-
-
-@dataclass
-class StageTiming:
-    name: str
-    ms: float
-
-
-@dataclass
-class LatencyRecord:
-    command: str
-    stages: list[StageTiming] = field(default_factory=list)
-    counters: dict[str, float] = field(default_factory=dict)
-
-    def add(self, name: str, ms: float) -> None:
-        self.stages.append(StageTiming(name, ms))
-
-    def set(self, key: str, value: float) -> None:
-        self.counters[key] = value
-
-    @property
-    def total_ms(self) -> float:
-        return sum(s.ms for s in self.stages)
 
 
 @contextmanager
@@ -68,6 +48,114 @@ def render_latency(rec: LatencyRecord, *, title: str | None = None) -> None:
                 ctable.add_row(k, f"{v:,}")
         console.print(ctable)
 
+
+# ---------------------------------------------------------------------------
+# Ragas integration: shared LangChain wrappers + metric computation
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def build_ragas_llm():
+    """Wrap Groq as a Ragas-compatible LangChain LLM (deferred import)."""
+    if not CFG.groq_api_key:
+        raise RuntimeError("GROQ_API_KEY not set in .env")
+    from langchain_openai import ChatOpenAI
+    from ragas.llms.base import LangchainLLMWrapper
+    llm = ChatOpenAI(
+        model=CFG.groq_model,
+        api_key=CFG.groq_api_key,
+        base_url=CFG.groq_base_url,
+        temperature=0.0,
+        timeout=60,
+        max_retries=3,
+    )
+    return LangchainLLMWrapper(llm)
+
+
+@lru_cache(maxsize=1)
+def build_ragas_embeddings():
+    """Wrap our local bge model as a Ragas-compatible LangChain embedding."""
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from ragas.embeddings.base import LangchainEmbeddingsWrapper
+    hf = HuggingFaceEmbeddings(
+        model_name=CFG.embed_model,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+    return LangchainEmbeddingsWrapper(hf)
+
+
+def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
+    """Compute Ragas metrics on a list of per-query samples.
+
+    Each sample is:
+        {question, answer, contexts: list[str], ground_truth: str | None}
+
+    Metrics auto-selected by availability:
+      - faithfulness, answer_relevancy:   always (need q, a, contexts)
+      - context_precision, context_recall: only when any ground_truth is present
+    """
+    if not samples:
+        return {}
+    from datasets import Dataset
+    from ragas import evaluate
+    from ragas.metrics import (
+        answer_relevancy,
+        context_precision,
+        context_recall,
+        faithfulness,
+    )
+
+    any_gt = any(s.get("ground_truth") for s in samples)
+    metrics = [faithfulness, answer_relevancy]
+    if any_gt:
+        metrics += [context_precision, context_recall]
+
+    rows = []
+    for s in samples:
+        row = {
+            "user_input": s["question"],
+            "response": s["answer"],
+            "retrieved_contexts": list(s.get("contexts") or []),
+        }
+        gt = s.get("ground_truth")
+        if any_gt:
+            row["reference"] = gt or ""
+        rows.append(row)
+
+    ds = Dataset.from_list(rows)
+    result = evaluate(
+        ds,
+        metrics=metrics,
+        llm=build_ragas_llm(),
+        embeddings=build_ragas_embeddings(),
+        show_progress=True,
+    )
+    df = result.to_pandas()
+    out: dict[str, float] = {}
+    for m in metrics:
+        col = m.name
+        if col in df.columns:
+            series = df[col].dropna()
+            if len(series):
+                out[col] = float(series.mean())
+    return out
+
+
+def render_ragas_metrics(scores: dict[str, float]) -> None:
+    if not scores:
+        console.print("[dim]no ragas scores to render[/dim]")
+        return
+    table = Table(title="Ragas metrics (mean across queries)", show_lines=False)
+    table.add_column("metric", style="cyan")
+    table.add_column("mean", justify="right", style="green")
+    for k, v in scores.items():
+        table.add_row(k, f"{v:.4f}")
+    console.print(table)
+
+
+# ---------------------------------------------------------------------------
+# Latency helpers
+# ---------------------------------------------------------------------------
 
 def percentiles(values: list[float]) -> dict[str, float]:
     if not values:
