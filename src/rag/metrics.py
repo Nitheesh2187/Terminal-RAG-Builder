@@ -115,17 +115,26 @@ def build_ragas_embeddings():
     return LangchainEmbeddingsWrapper(hf)
 
 
-def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
-    """Compute Ragas metrics on a list of per-query samples.
+def compute_ragas_metrics(
+    samples: list[dict],
+    *,
+    include_llm_metrics: bool = False,
+) -> dict[str, float]:
+    """Compute Ragas metrics on per-query samples.
 
-    Each sample is:
-        {question, answer, contexts, ground_truth?, reference_contexts?}
+    Each sample:
+        {question, contexts, ground_truth?, reference_contexts?, response?}
 
-    Metrics auto-selected by what's available:
-      - faithfulness, answer_relevancy:                       always (need q, a, contexts)
-      - context_precision, context_recall (LLM-judged):       when any ground_truth is present
-      - non_llm_context_precision, non_llm_context_recall:    when any reference_contexts present
-        (string-similarity based — deterministic, no LLM calls, no rate limits)
+    What runs:
+      Non-LLM (always when applicable, free, deterministic):
+        - non_llm_context_precision_with_reference  (needs reference_contexts)
+        - non_llm_context_recall                    (needs reference_contexts)
+
+      LLM-judged (only when include_llm_metrics=True — burns LLM calls):
+        - faithfulness          (needs response)
+        - answer_relevancy      (needs response)
+        - context_precision     (needs ground_truth)
+        - context_recall        (needs ground_truth)
     """
     if not samples:
         return {}
@@ -138,16 +147,14 @@ def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
         faithfulness,
     )
 
+    any_response = any(s.get("response") for s in samples)
     any_gt = any(s.get("ground_truth") for s in samples)
     any_ref_ctx = any(s.get("reference_contexts") for s in samples)
 
-    metrics = [faithfulness, answer_relevancy]
-    if any_gt:
-        metrics += [context_precision, context_recall]
+    metrics = []
 
+    # Non-LLM: string-similarity, no rate-limit pressure.
     if any_ref_ctx:
-        # Non-LLM variants — string-similarity, no rate-limit pressure.
-        # Import lazily so older Ragas installs don't break the whole module.
         try:
             from ragas.metrics import (
                 NonLLMContextPrecisionWithReference,
@@ -163,24 +170,40 @@ def compute_ragas_metrics(samples: list[dict]) -> dict[str, float]:
                 "in this ragas version — install ragas>=0.2.10"
             )
 
+    # LLM-judged — only when explicitly opted into.
+    if include_llm_metrics:
+        if any_response:
+            metrics += [faithfulness, answer_relevancy]
+        if any_gt:
+            metrics += [context_precision, context_recall]
+
+    if not metrics:
+        console.print("[dim]ragas: no applicable metrics for this sample shape[/dim]")
+        return {}
+
     rows = []
     for s in samples:
         row = {
             "user_input": s["question"],
-            "response": s["answer"],
             "retrieved_contexts": list(s.get("contexts") or []),
         }
+        if any_response:
+            row["response"] = s.get("response") or ""
         if any_gt:
             row["reference"] = s.get("ground_truth") or ""
         if any_ref_ctx:
             row["reference_contexts"] = list(s.get("reference_contexts") or [])
         rows.append(row)
 
+    needs_llm = include_llm_metrics and any(
+        m in metrics for m in [faithfulness, answer_relevancy, context_precision, context_recall]
+    )
+
     ds = Dataset.from_list(rows)
     result = evaluate(
         ds,
         metrics=metrics,
-        llm=build_ragas_llm(),
+        llm=build_ragas_llm() if needs_llm else None,
         embeddings=build_ragas_embeddings(),
         show_progress=True,
     )

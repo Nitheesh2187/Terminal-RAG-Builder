@@ -45,19 +45,13 @@ def load_golden(path: Path | str) -> list[GoldenItem]:
 
 def run_evaluation(*, golden_path: Path | str | None = None,
                    k: int | None = None,
-                   with_generation: bool = False,
-                   with_ragas: bool = False) -> dict:
+                   with_generation: bool = False) -> dict:
     golden_path = Path(golden_path or CFG.golden_path)
     k = k or CFG.top_k
     items = load_golden(golden_path)
     if not items:
         console.print("[yellow]golden set is empty[/yellow]")
         return {}
-
-    # Ragas needs generated answers
-    if with_ragas and not with_generation:
-        console.print("[dim]--ragas implies generation; enabling[/dim]")
-        with_generation = True
 
     per_query_latencies: dict[str, list[float]] = {
         "embed_query": [], "dense_sql": [], "sparse_sql": [], "rrf_fuse": [], "llm_generate": [], "total": [],
@@ -66,8 +60,7 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     ragas_samples: list[dict] = []
 
     console.print(
-        f"[cyan]evaluate[/cyan]: {len(items)} queries, k={k}, "
-        f"generate={with_generation}, ragas={with_ragas}"
+        f"[cyan]evaluate[/cyan]: {len(items)} queries, k={k}, generate={with_generation}"
     )
     t_overall = time.perf_counter()
     for item in items:
@@ -92,14 +85,16 @@ def run_evaluation(*, golden_path: Path | str | None = None,
             except Exception as e:
                 console.print(f"[red]gen fail[/red]: {e}")
 
-        if with_ragas and ans_text is not None:
-            ragas_samples.append({
-                "question": item.question,
-                "answer": ans_text,
-                "contexts": [h.content for h in hits],
-                "ground_truth": item.gold_answer,
-                "reference_contexts": item.reference_contexts,
-            })
+        # Always build a sample — non-LLM Ragas metrics work without a response.
+        sample = {
+            "question": item.question,
+            "contexts": [h.content for h in hits],
+            "ground_truth": item.gold_answer,
+            "reference_contexts": item.reference_contexts,
+        }
+        if ans_text is not None:
+            sample["response"] = ans_text
+        ragas_samples.append(sample)
 
         for s in rec.stages:
             per_query_latencies.setdefault(s.name, []).append(s.ms)
@@ -142,18 +137,19 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     render_latency(summary_rec, title="/evaluate — summary")
 
     ragas_scores: dict[str, float] = {}
-    if with_ragas:
-        if not ragas_samples:
-            console.print("[yellow]ragas: no samples (generation may have failed)[/yellow]")
-        else:
-            console.print(f"[cyan]ragas[/cyan]: scoring {len(ragas_samples)} samples (LLM calls — slow)")
-            t_r = time.perf_counter()
-            try:
-                ragas_scores = compute_ragas_metrics(ragas_samples)
-                console.print(f"[dim]ragas wall: {time.perf_counter() - t_r:.1f}s[/dim]")
-                render_ragas_metrics(ragas_scores)
-            except Exception as e:
-                console.print(f"[red]ragas failed[/red]: {e}")
+    if ragas_samples:
+        kind = "with LLM judge" if with_generation else "non-LLM only"
+        console.print(f"[cyan]ragas[/cyan]: scoring {len(ragas_samples)} samples ({kind})")
+        t_r = time.perf_counter()
+        try:
+            ragas_scores = compute_ragas_metrics(
+                ragas_samples,
+                include_llm_metrics=with_generation,
+            )
+            console.print(f"[dim]ragas wall: {time.perf_counter() - t_r:.1f}s[/dim]")
+            render_ragas_metrics(ragas_scores)
+        except Exception as e:
+            console.print(f"[red]ragas failed[/red]: {e}")
 
     return {
         "metrics": {k: (sum(v) / len(v) if v else 0.0) for k, v in metrics_acc.items()},
