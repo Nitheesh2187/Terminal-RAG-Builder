@@ -12,7 +12,10 @@ from .config import CFG
 from .generate import generate_answer
 from .metrics import (
     compute_ragas_metrics,
+    context_overlap_detail,
+    context_overlap_metrics,
     percentiles,
+    render_context_overlap,
     render_latency,
     render_ragas_metrics,
     retrieval_metrics,
@@ -136,15 +139,24 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     summary_rec.set("queries_per_sec", len(items) / wall_s if wall_s > 0 else 0.0)
     render_latency(summary_rec, title="/evaluate — summary")
 
-    ragas_scores: dict[str, float] = {}
+    # No-LLM context precision/recall — deterministic n-gram overlap, no API.
+    ctx_scores: dict[str, float] = {}
     if ragas_samples:
-        kind = "with LLM judge" if with_generation else "non-LLM only"
-        console.print(f"[cyan]ragas[/cyan]: scoring {len(ragas_samples)} samples ({kind})")
+        ctx_scores = context_overlap_metrics(ragas_samples)
+        render_context_overlap(ctx_scores)
+        _render_overlap_calibration(items, ragas_samples)
+
+    # LLM-judged Ragas metrics — only when generation is enabled (burns calls).
+    ragas_scores: dict[str, float] = {}
+    if ragas_samples and with_generation:
+        console.print(
+            f"[cyan]ragas[/cyan]: scoring {len(ragas_samples)} samples (LLM judge)"
+        )
         t_r = time.perf_counter()
         try:
             ragas_scores = compute_ragas_metrics(
                 ragas_samples,
-                include_llm_metrics=with_generation,
+                include_llm_metrics=True,
             )
             console.print(f"[dim]ragas wall: {time.perf_counter() - t_r:.1f}s[/dim]")
             render_ragas_metrics(ragas_scores)
@@ -154,7 +166,26 @@ def run_evaluation(*, golden_path: Path | str | None = None,
     return {
         "metrics": {k: (sum(v) / len(v) if v else 0.0) for k, v in metrics_acc.items()},
         "latencies_ms": {k: percentiles(v) for k, v in per_query_latencies.items() if v},
+        "context": ctx_scores,
         "ragas": ragas_scores,
         "queries": len(items),
         "wall_seconds": wall_s,
     }
+
+
+def _render_overlap_calibration(items: list[GoldenItem], samples: list[dict]) -> None:
+    """Per-span union-coverage — eyeball this to pick CTX_OVERLAP_THRESHOLD.
+    A correctly-retrieved span sits high (→1.0); a missed one sits near 0."""
+    table = Table(title="context-overlap calibration (per-span union coverage)", show_lines=False)
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("span coverage", style="green")
+    table.add_column("question", style="cyan", no_wrap=True, max_width=60)
+    any_rows = False
+    for i, (item, sample) in enumerate(zip(items, samples)):
+        covs = context_overlap_detail(sample)
+        if not covs:
+            continue
+        any_rows = True
+        table.add_row(str(i), " ".join(f"{c:.2f}" for c in covs), item.question)
+    if any_rows:
+        console.print(table)

@@ -35,5 +35,11 @@ class Config:
     chunk_tokens: int = int(os.getenv("CHUNK_TOKENS", "800"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "100"))
 
+    # No-LLM context precision/recall (n-gram overlap between retrieved chunks
+    # and gold reference spans). Tune the threshold with the per-span soft
+    # scores printed by /evaluate — see metrics.context_overlap_metrics.
+    ctx_overlap_n: int = int(os.getenv("CTX_OVERLAP_N", "3"))
+    ctx_overlap_threshold: float = float(os.getenv("CTX_OVERLAP_THRESHOLD", "0.45"))
+
 
 CFG = Config()

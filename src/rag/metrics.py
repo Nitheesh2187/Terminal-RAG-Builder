@@ -46,6 +46,180 @@ def retrieval_metrics(retrieved_doc_ids: list[str], gold: list[str], k: int) -> 
     return {"hit@1": hit_at_1, "recall@k": recall, "mrr@k": mrr, "ndcg@k": ndcg}
 
 
+# ---------------------------------------------------------------------------
+# No-LLM context precision/recall via n-gram overlap (deterministic, free)
+#
+# Replaces Ragas' NonLLM* metrics, which compare strings with Levenshtein
+# edit-distance and a 0.5 threshold. That collapses toward 0 whenever a
+# retrieved chunk and a gold span differ in length — even when the chunk
+# fully contains the span — so it measured byte-equality, not retrieval.
+#
+# Here we compare *n-gram sets*, which is robust to chunk boundaries and to
+# PDF-extraction artifacts (hyphenation, ligatures), and is symmetric in
+# length. No LLM, no API, no rate limits.
+# ---------------------------------------------------------------------------
+
+def _normalize_tokens(text: str) -> list[str]:
+    """Lowercase, rejoin PDF hyphenation ('architec- tural' -> 'architectural'),
+    then split into alphanumeric word tokens. Tolerant enough that text from two
+    different PDF parsers still overlaps."""
+    if not text:
+        return []
+    t = text.lower().replace("- ", "")   # join hyphenated line/word breaks
+    tokens: list[str] = []
+    cur: list[str] = []
+    for ch in t:
+        if ch.isalnum():
+            cur.append(ch)
+        elif cur:
+            tokens.append("".join(cur))
+            cur = []
+    if cur:
+        tokens.append("".join(cur))
+    return tokens
+
+
+def _ngrams(tokens: list[str], n: int) -> set[tuple]:
+    if not tokens:
+        return set()
+    if len(tokens) <= n:
+        return {tuple(tokens)}
+    return {tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def _coverage(a: set, b: set) -> float:
+    """Fraction of `a` found in `b`. 0 if `a` is empty."""
+    return len(a & b) / len(a) if a else 0.0
+
+
+def _overlap_coef(a: set, b: set) -> float:
+    """Szymkiewicz-Simpson overlap coefficient: |a∩b| / min(|a|,|b|).
+    Symmetric in length — high when the smaller set is largely contained in
+    the larger, so a small gold span inside a big chunk (and vice versa) both
+    score high. This is the relevance test for context precision."""
+    if not a or not b:
+        return 0.0
+    return len(a & b) / min(len(a), len(b))
+
+
+def context_overlap_metrics(
+    samples: list[dict],
+    *,
+    n: int | None = None,
+    threshold: float | None = None,
+) -> dict[str, float]:
+    """No-LLM context precision/recall via n-gram overlap.
+
+    Each sample: {question, contexts: [chunk_text...], reference_contexts: [span...]}
+
+    Definitions (per query, then averaged):
+      recall    — fraction of gold spans 'covered': a span is covered if
+                  |span_ngrams ∩ (union of retrieved chunk ngrams)| / |span_ngrams|
+                  >= threshold. (Union, so a span split across adjacent chunks
+                  still counts.)
+      precision — fraction of retrieved chunks that are 'relevant': a chunk is
+                  relevant if its overlap coefficient with some gold span
+                  >= threshold.
+
+    Also returns *_soft (the same scores without thresholding, mean of the
+    continuous values) — use these to compare chunking strategies without a
+    threshold artifact, and to calibrate `threshold`.
+    """
+    n = n or CFG.ctx_overlap_n
+    threshold = threshold if threshold is not None else CFG.ctx_overlap_threshold
+
+    prec_bin, rec_bin, prec_soft, rec_soft = [], [], [], []
+    mrr_list, map_list = [], []
+    n_scored = 0
+    for s in samples:
+        spans = [_ngrams(_normalize_tokens(r), n) for r in (s.get("reference_contexts") or [])]
+        spans = [sp for sp in spans if sp]
+        if not spans:
+            continue
+        n_scored += 1
+        chunks = [_ngrams(_normalize_tokens(c), n) for c in (s.get("contexts") or [])]
+
+        union: set = set().union(*chunks) if chunks else set()
+        span_cov = [_coverage(sp, union) for sp in spans]
+        rec_soft.append(sum(span_cov) / len(span_cov))
+        rec_bin.append(sum(1 for c in span_cov if c >= threshold) / len(span_cov))
+
+        if chunks:
+            # chunks arrive in rank order (hybrid_search ranking preserved).
+            chunk_rel = [max((_overlap_coef(ch, sp) for sp in spans), default=0.0) for ch in chunks]
+            prec_soft.append(sum(chunk_rel) / len(chunk_rel))
+            prec_bin.append(sum(1 for c in chunk_rel if c >= threshold) / len(chunk_rel))
+
+            # Rank-aware, sparse-label-robust precision proxies. Unlike
+            # precision@k these do NOT degrade when you raise top_k: an
+            # irrelevant chunk added at the bottom changes neither.
+            rel_flags = [1 if c >= threshold else 0 for c in chunk_rel]
+            first = next((i for i, r in enumerate(rel_flags, 1) if r), 0)
+            mrr_list.append(1.0 / first if first else 0.0)
+            n_rel = sum(rel_flags)
+            if n_rel:
+                running, ap = 0, 0.0
+                for i, r in enumerate(rel_flags, 1):
+                    if r:
+                        running += 1
+                        ap += running / i
+                map_list.append(ap / n_rel)
+            else:
+                map_list.append(0.0)
+        else:
+            prec_soft.append(0.0)
+            prec_bin.append(0.0)
+            mrr_list.append(0.0)
+            map_list.append(0.0)
+
+    def _mean(xs: list[float]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    return {
+        "context_precision": _mean(prec_bin),
+        "context_recall": _mean(rec_bin),
+        "context_precision_soft": _mean(prec_soft),
+        "context_recall_soft": _mean(rec_soft),
+        "chunk_mrr": _mean(mrr_list),
+        "chunk_map": _mean(map_list),
+        "n_scored": float(n_scored),
+        "threshold": float(threshold),
+        "ngram_n": float(n),
+    }
+
+
+def context_overlap_detail(sample: dict, *, n: int | None = None) -> list[float]:
+    """Per-span union-coverage for one sample — for threshold calibration."""
+    n = n or CFG.ctx_overlap_n
+    spans = [_ngrams(_normalize_tokens(r), n) for r in (sample.get("reference_contexts") or [])]
+    spans = [sp for sp in spans if sp]
+    chunks = [_ngrams(_normalize_tokens(c), n) for c in (sample.get("contexts") or [])]
+    union: set = set().union(*chunks) if chunks else set()
+    return [_coverage(sp, union) for sp in spans]
+
+
+def render_context_overlap(scores: dict[str, float]) -> None:
+    if not scores:
+        console.print("[dim]no context-overlap scores to render[/dim]")
+        return
+    table = Table(
+        title=(
+            f"context metrics (no-LLM n-gram overlap, "
+            f"n={int(scores.get('ngram_n', 0))}, thr={scores.get('threshold', 0):.2f}, "
+            f"queries={int(scores.get('n_scored', 0))})"
+        ),
+        show_lines=False,
+    )
+    table.add_column("metric", style="cyan")
+    table.add_column("value", justify="right", style="green")
+    for key in ("context_precision", "context_recall",
+                "context_precision_soft", "context_recall_soft",
+                "chunk_mrr", "chunk_map"):
+        if key in scores:
+            table.add_row(key, f"{scores[key]:.4f}")
+    console.print(table)
+
+
 @contextmanager
 def stage(rec: LatencyRecord, name: str):
     t0 = time.perf_counter()

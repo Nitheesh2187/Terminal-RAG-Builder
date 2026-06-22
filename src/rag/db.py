@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS chunks (
     UNIQUE (doc_id, chunk_idx)
 );
 
+CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
+    ON chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX IF NOT EXISTS chunks_tsv_gin
+    ON chunks USING gin (tsv);
+
+CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks (doc_id);
+
 """
 
 INDEX_SQL = """
