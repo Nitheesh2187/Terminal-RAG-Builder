@@ -13,7 +13,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from .chunking import chunk_text
+from .chunking import chunk_sections, chunk_text
 from .config import CFG
 from .db import (
     connect,
@@ -27,7 +27,7 @@ from .db import (
 from .embed import embed_texts
 from .metrics import render_latency, stage
 from .models import LatencyRecord
-from .pdf import pdf_to_text
+from .pdf import pdf_to_sections, pdf_to_text
 
 console = Console()
 
@@ -102,14 +102,24 @@ def run_ingest(*, limit: int | None = None, reset: bool = False) -> LatencyRecor
                 doc_id = pdf.stem.replace("_", "/")
                 meta = meta_index.get(doc_id, {})
                 try:
+                    # Branch on CHUNK_STRATEGY: "section" (TOC-aware) or "recursive" (flat)
+                    use_sections = CFG.chunk_strategy == "section"
                     t0 = time.perf_counter()
-                    text = pdf_to_text(pdf)
+                    if use_sections:
+                        sections = pdf_to_sections(pdf)
+                    else:
+                        flat_text = pdf_to_text(pdf)
                     parse_ms += (time.perf_counter() - t0) * 1000
 
                     t0 = time.perf_counter()
-                    chunks = chunk_text(
-                        text, max_tokens=CFG.chunk_tokens, overlap=CFG.chunk_overlap
-                    )
+                    if use_sections:
+                        chunks = chunk_sections(
+                            sections, max_tokens=CFG.chunk_tokens, overlap=CFG.chunk_overlap
+                        )
+                    else:
+                        chunks = chunk_text(
+                            flat_text, max_tokens=CFG.chunk_tokens, overlap=CFG.chunk_overlap
+                        )
                     chunk_ms += (time.perf_counter() - t0) * 1000
                     if not chunks:
                         n_docs_fail += 1

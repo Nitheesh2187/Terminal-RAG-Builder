@@ -34,6 +34,16 @@ class Config:
 
     chunk_tokens: int = int(os.getenv("CHUNK_TOKENS", "800"))
     chunk_overlap: int = int(os.getenv("CHUNK_OVERLAP", "100"))
+    # "section"   = TOC-aware section chunking (pdf_to_sections + chunk_sections)
+    # "recursive" = old behavior: flat text + recursive token splitter
+    chunk_strategy: str = os.getenv("CHUNK_STRATEGY", "section").lower()
+
+    # Cross-encoder reranker (optional). When enabled, hybrid_search pulls a
+    # bigger candidate pool from RRF, then re-scores each (query, chunk) pair
+    # with a cross-encoder and returns the top-k by that score.
+    rerank_enabled: bool = os.getenv("RERANK_ENABLED", "false").lower() in ("1", "true", "yes")
+    rerank_model: str = os.getenv("RERANK_MODEL", "BAAI/bge-reranker-base")
+    rerank_pool: int = int(os.getenv("RERANK_POOL", "30"))
 
     # No-LLM context precision/recall (n-gram overlap between retrieved chunks
     # and gold reference spans). Tune the threshold with the per-span soft

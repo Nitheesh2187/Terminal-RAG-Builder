@@ -42,6 +42,28 @@ def _split_recursive(text: str, max_toks: int, seps: list[str]) -> list[str]:
     return out
 
 
+def chunk_sections(sections, *, max_tokens: int = 800, overlap: int = 100) -> list[Chunk]:
+    """Chunk each section independently, preserving the section title on every chunk.
+
+    Long sections get sub-chunked with the same recursive token-aware splitter.
+    Chunk indices are reassigned globally across the document so they stay unique.
+    """
+    out: list[Chunk] = []
+    for s in sections:
+        title = getattr(s, "title", None) if not isinstance(s, tuple) else s[0]
+        text = getattr(s, "text", None) if not isinstance(s, tuple) else s[1]
+        if not text:
+            continue
+        sub = chunk_text(text, max_tokens=max_tokens, overlap=overlap)
+        for c in sub:
+            c.section = title
+            out.append(c)
+    # Re-number globally so chunk_idx is unique within the doc
+    for new_idx, c in enumerate(out):
+        c.idx = new_idx
+    return out
+
+
 def chunk_text(text: str, *, max_tokens: int = 800, overlap: int = 100) -> list[Chunk]:
     """Recursive split, then add token overlap between adjacent chunks."""
     base = _split_recursive(text, max_tokens, SEPARATORS)

@@ -32,6 +32,7 @@ class Chunk:
     idx: int
     text: str
     n_tokens: int
+    section: str | None = None
 
 
 @dataclass
@@ -41,11 +42,13 @@ class Hit:
     chunk_idx: int
     content: str
     title: str | None
+    section: str | None
     dense_rank: int | None
     sparse_rank: int | None
     dense_score: float | None
     sparse_score: float | None
     rrf_score: float
+    rerank_score: float | None = None
 
 
 @dataclass
