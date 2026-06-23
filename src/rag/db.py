@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     chunk_idx   INTEGER NOT NULL,
     content     TEXT NOT NULL,
     section     TEXT,
+    element_type TEXT NOT NULL DEFAULT 'text',
     n_tokens    INTEGER NOT NULL,
     embedding   vector({dim}) NOT NULL,
     tsv         tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
@@ -90,10 +91,17 @@ def connect():
         yield conn
 
 
+# Idempotent migrations for DBs created before a column existed.
+MIGRATE_SQL = """
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS element_type TEXT NOT NULL DEFAULT 'text';
+"""
+
+
 def init_schema() -> None:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL.format(dim=CFG.embed_dim))
+            cur.execute(MIGRATE_SQL)
         conn.commit()
 
 
@@ -161,12 +169,12 @@ def insert_chunks(conn, doc_id: str, chunks: Sequence[Chunk], embeddings: np.nda
     with conn.cursor() as cur:
         cur.execute("DELETE FROM chunks WHERE doc_id = %s;", (doc_id,))
         rows = [
-            (doc_id, c.idx, c.text, c.section, c.n_tokens, embeddings[i])
+            (doc_id, c.idx, c.text, c.section, c.element_type, c.n_tokens, embeddings[i])
             for i, c in enumerate(chunks)
         ]
         cur.executemany(
-            "INSERT INTO chunks (doc_id, chunk_idx, content, section, n_tokens, embedding)"
-            " VALUES (%s, %s, %s, %s, %s, %s);",
+            "INSERT INTO chunks (doc_id, chunk_idx, content, section, element_type, n_tokens, embedding)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s);",
             rows,
         )
 
@@ -178,13 +186,13 @@ def insert_chunks(conn, doc_id: str, chunks: Sequence[Chunk], embeddings: np.nda
 def dense_search(conn, qvec, k: int) -> list[tuple]:
     """Top-k chunks by cosine similarity to qvec, joined with document title.
 
-    Returns rows of: (id, doc_id, chunk_idx, content, title, section, score).
+    Returns rows of: (id, doc_id, chunk_idx, content, title, section, score, element_type).
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT c.id, c.doc_id, c.chunk_idx, c.content, d.title, c.section,
-                   1 - (c.embedding <=> %s::vector) AS score
+                   1 - (c.embedding <=> %s::vector) AS score, c.element_type
             FROM chunks c
             LEFT JOIN documents d ON d.doc_id = c.doc_id
             ORDER BY c.embedding <=> %s::vector
@@ -198,13 +206,13 @@ def dense_search(conn, qvec, k: int) -> list[tuple]:
 def sparse_search(conn, query: str, k: int) -> list[tuple]:
     """Top-k chunks by Postgres FTS ts_rank, joined with document title.
 
-    Returns rows of: (id, doc_id, chunk_idx, content, title, section, score).
+    Returns rows of: (id, doc_id, chunk_idx, content, title, section, score, element_type).
     """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT c.id, c.doc_id, c.chunk_idx, c.content, d.title, c.section,
-                   ts_rank(c.tsv, plainto_tsquery('english', %s)) AS score
+                   ts_rank(c.tsv, plainto_tsquery('english', %s)) AS score, c.element_type
             FROM chunks c
             LEFT JOIN documents d ON d.doc_id = c.doc_id
             WHERE c.tsv @@ plainto_tsquery('english', %s)

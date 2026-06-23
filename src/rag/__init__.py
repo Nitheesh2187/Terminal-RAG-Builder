@@ -22,20 +22,24 @@ if _os.environ.get("EMBED_DEVICE", "cpu").lower() == "cuda":
 else:
     _os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-# Flip HuggingFace to offline mode once every model we'll load is cached on
-# disk. Without this, sentence-transformers makes a metadata HEAD request to
-# huggingface.co on EVERY model load — slow at best, fatal when offline.
-# First-time runs still hit the network (cache miss), then go offline forever.
-_hf_home = _Path(_os.environ.get("HF_HOME", _Path.home() / ".cache" / "huggingface"))
-_required_models = [_os.environ.get("EMBED_MODEL", "BAAI/bge-small-en-v1.5")]
-if _os.environ.get("RERANK_ENABLED", "false").lower() in ("1", "true", "yes"):
-    _required_models.append(_os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-base"))
-_all_cached = all(
-    (_hf_home / "hub" / f"models--{m.replace('/', '--')}").exists()
-    for m in _required_models
-)
-if _all_cached:
-    _os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    _os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+# Per-model offline detection. sentence-transformers makes a metadata HEAD
+# request to huggingface.co on EVERY model load — slow at best, fatal when
+# offline — so we pass local_files_only=True to those loads once the model is
+# cached (see embed.py / rerank.py). We deliberately do NOT set a *global*
+# HF_HUB_OFFLINE: that would also block the "unstructured" strategy from lazily
+# downloading its layout/table models from the Hub on first use (and can't see a
+# --chunk-strategy chosen at runtime, after this module is imported).
+_HF_HOME = _Path(_os.environ.get("HF_HOME", _Path.home() / ".cache" / "huggingface"))
+
+
+def hf_model_cached(model_id: str) -> bool:
+    """True if `model_id` is already present in the local HF hub cache.
+
+    Pass the result as local_files_only= to a sentence-transformers load to skip
+    the network HEAD check when the model is on disk, while still allowing a
+    download on the first (cache-miss) run.
+    """
+    return (_HF_HOME / "hub" / f"models--{model_id.replace('/', '--')}").exists()
+
 
 __version__ = "0.1.0"

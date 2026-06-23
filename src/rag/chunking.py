@@ -64,6 +64,30 @@ def chunk_sections(sections, *, max_tokens: int = 800, overlap: int = 100) -> li
     return out
 
 
+def chunk_unstructured(sections, tables, *, max_tokens: int = 800, overlap: int = 100) -> list[Chunk]:
+    """Chunk narrative sections normally, then isolate each table as its own chunk(s).
+
+    Tables are kept entirely separate from the prose: each table is chunked on
+    its own (with NO overlap, so neighbouring text/tables can't bleed in) and
+    tagged ``element_type="table"`` so it stays a distinct retrieval unit. Most
+    tables fit in one chunk; oversized ones are sub-split by the same splitter.
+    Chunk indices are reassigned globally so they stay unique within the doc.
+    """
+    out = chunk_sections(sections, max_tokens=max_tokens, overlap=overlap)
+    for t in tables:
+        # Prefer the structured HTML rendering when present; fall back to cell text.
+        body = (getattr(t, "html", None) or getattr(t, "text", "") or "").strip()
+        if not body:
+            continue
+        for c in chunk_text(body, max_tokens=max_tokens, overlap=0):
+            c.section = getattr(t, "section", None)
+            c.element_type = "table"
+            out.append(c)
+    for new_idx, c in enumerate(out):
+        c.idx = new_idx
+    return out
+
+
 def chunk_text(text: str, *, max_tokens: int = 800, overlap: int = 100) -> list[Chunk]:
     """Recursive split, then add token overlap between adjacent chunks."""
     base = _split_recursive(text, max_tokens, SEPARATORS)

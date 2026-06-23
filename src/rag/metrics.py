@@ -264,14 +264,24 @@ def build_ragas_llm():
     if not CFG.groq_api_key:
         raise RuntimeError("GROQ_API_KEY not set in .env")
     from langchain_openai import ChatOpenAI
+    from langchain_ollama import ChatOllama
     from ragas.llms.base import LangchainLLMWrapper
-    llm = ChatOpenAI(
-        model=CFG.groq_model,
-        api_key=CFG.groq_api_key,
-        base_url=CFG.groq_base_url,
+    # llm = ChatOpenAI(
+    #     model=CFG.groq_model,
+    #     api_key=CFG.groq_api_key,
+    #     base_url=CFG.groq_base_url,
+    #     temperature=0.0,
+    #     timeout=60,
+    #     max_retries=3,
+    # )
+    llm = ChatOllama(
+        model="qwen2.5:7b",
         temperature=0.0,
-        timeout=60,
-        max_retries=3,
+        # Grammar-constrain output to valid JSON. Ragas parses every LLM
+        # response with a pydantic JSON parser; without this a 7B model emits
+        # bare prose and the parse chain fails (OutputParserException).
+        format="json",
+        num_ctx=8192,
     )
     return LangchainLLMWrapper(llm)
 

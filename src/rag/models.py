@@ -33,6 +33,7 @@ class Chunk:
     text: str
     n_tokens: int
     section: str | None = None
+    element_type: str = "text"  # "text" | "table" — set by the unstructured strategy
 
 
 @dataclass
@@ -43,6 +44,7 @@ class Hit:
     content: str
     title: str | None
     section: str | None
+    element_type: str
     dense_rank: int | None
     sparse_rank: int | None
     dense_score: float | None
@@ -65,3 +67,22 @@ class GoldenItem:
     gold_doc_ids: list[str]
     gold_answer: str | None = None
     reference_contexts: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Section:
+    title: str | None
+    text: str
+
+
+@dataclass
+class Table:
+    """A table extracted as its own element (kept out of the prose stream).
+
+    `html` is unstructured's reconstructed table markup (present only when table
+    structure inference succeeds); `text` is the flattened cell text fallback.
+    """
+    text: str
+    html: str | None = None
+    section: str | None = None
+    page: int | None = None

@@ -20,8 +20,14 @@ def _reranker():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from sentence_transformers import CrossEncoder
 
+    from . import hf_model_cached
+
     device = os.getenv("EMBED_DEVICE", "cpu")
-    return CrossEncoder(CFG.rerank_model, device=device, max_length=512)
+    # local_files_only when cached → skip the per-load HEAD request to the Hub.
+    return CrossEncoder(
+        CFG.rerank_model, device=device, max_length=512,
+        local_files_only=hf_model_cached(CFG.rerank_model),
+    )
 
 
 def rerank(query: str, hits: list[Hit], k: int) -> list[Hit]:

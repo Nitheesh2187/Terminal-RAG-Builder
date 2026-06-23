@@ -14,8 +14,13 @@ def _model():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     from sentence_transformers import SentenceTransformer
 
+    from . import hf_model_cached
+
     device = CFG.embed_device.lower()
-    return SentenceTransformer(CFG.embed_model, device=device)
+    # local_files_only when cached → skip the per-load HEAD request to the Hub.
+    return SentenceTransformer(
+        CFG.embed_model, device=device, local_files_only=hf_model_cached(CFG.embed_model)
+    )
 
 
 def embed_texts(texts: list[str], *, batch_size: int | None = None) -> np.ndarray:

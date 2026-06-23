@@ -48,7 +48,12 @@ Every command prints a latency table with per-stage timings (ms, % of total) and
 ## Pipelines
 
 ### `/ingest`
-PyMuPDF text extraction → recursive token-aware chunking (800 toks / 100 overlap) → batched embeddings → upsert into `documents` + `chunks`. Stage timings: `pdf_parse`, `chunk`, `embed`, `upsert`. Counters: docs/sec, chunks/sec, tokens indexed.
+PDF parse → chunking → batched embeddings → upsert into `documents` + `chunks`. Stage timings: `pdf_parse`, `chunk`, `embed`, `upsert`. Counters: docs/sec, chunks/sec, tokens indexed.
+
+Parsing + chunking are selected by `CHUNK_STRATEGY`:
+- `section` — PyMuPDF, TOC/heading-aware section chunking.
+- `recursive` — PyMuPDF flat text, recursive token-aware splitter (800 toks / 100 overlap).
+- `unstructured` — layout-aware parse via the [`unstructured`](https://github.com/Unstructured-IO/unstructured) library. Tables are extracted as their own elements and chunked **separately** (`element_type='table'`, no overlap, never folded into prose); narrative text is section-chunked as usual. Needs `pip install 'unstructured[pdf]'`. The default `hi_res` strategy (required for table-structure inference) also needs the system binaries **`poppler`** and **`tesseract-ocr`** — `sudo apt install poppler-utils tesseract-ocr`. Tune with `UNSTRUCTURED_STRATEGY` (`hi_res` for tables, `fast` for text-only / no system deps) and `UNSTRUCTURED_INFER_TABLES`.
 
 ### `/retrieve` and free-form query
 1. Embed query (with bge query prefix).
@@ -72,7 +77,8 @@ src/rag/
   cli.py            REPL + command dispatch
   config.py         env-driven config
   db.py             pgvector schema + pool
-  chunking.py       token-aware recursive splitter
+  pdf.py            PDF parsing (PyMuPDF sections + unstructured layout/tables)
+  chunking.py       token-aware splitter (+ table-isolating unstructured chunker)
   embed.py          sentence-transformers wrapper
   ingest.py         /ingest pipeline
   retrieve.py       /retrieve pipeline (hybrid + RRF)

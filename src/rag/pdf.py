@@ -1,8 +1,11 @@
 """PDF text + section extraction.
 
-Two entry points:
-  - pdf_to_text(path)      → str           (whole-document text, flat)
-  - pdf_to_sections(path)  → list[Section] (title + body per section)
+Three entry points:
+  - pdf_to_text(path)          → str                     (whole-document text, flat)
+  - pdf_to_sections(path)      → list[Section]           (title + body per section)
+  - pdf_to_unstructured(path)  → (list[Section], list[Table])
+                                 layout-aware parse via the `unstructured` library,
+                                 with tables pulled out as separate elements
 
 Section extraction tries the PDF's embedded TOC first (most reliable, when
 present), then falls back to regex heuristics over the flat text. If nothing
@@ -16,11 +19,10 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from .config import CFG
+from .models import Section, Table
 
-@dataclass
-class Section:
-    title: str | None
-    text: str
+
 
 
 def pdf_to_text(path: Path) -> str:
@@ -209,3 +211,88 @@ def pdf_to_sections(path: Path) -> list[Section]:
         return rx_sections
     # Last resort: whole doc as one section
     return [Section(title=None, text=flat)]
+
+
+# ---------------------------------------------------------------------------
+# Unstructured-based parsing (layout + table aware)
+# ---------------------------------------------------------------------------
+
+# Page running headers/footers and pagination — noise we drop rather than fold
+# into section bodies. ("Title" is a real heading and becomes a section break.)
+_UNSTRUCTURED_NOISE = {"Header", "Footer", "PageNumber"}
+
+
+def pdf_to_unstructured(path: Path) -> tuple[list[Section], list[Table]]:
+    """Parse a PDF with the `unstructured` library, isolating tables.
+
+    Returns ``(sections, tables)``:
+      * sections — narrative/text elements grouped under the most recent heading
+        ("Title" elements act as section boundaries). Same shape as
+        ``pdf_to_sections`` so the normal chunker can consume them.
+      * tables   — each detected table as a standalone ``Table`` (never folded
+        into the prose), to be chunked separately downstream.
+
+    Table *structure* (the ``html`` field) requires the "hi_res" strategy with
+    table inference enabled — see ``UNSTRUCTURED_STRATEGY`` /
+    ``UNSTRUCTURED_INFER_TABLES`` in config. "fast" yields text-only.
+    """
+    try:
+        from unstructured.partition.pdf import partition_pdf
+    except ImportError as e:  # pragma: no cover - dependency guard
+        raise RuntimeError(
+            "CHUNK_STRATEGY='unstructured' needs the 'unstructured' package with PDF "
+            "support. Install it with:  pip install 'unstructured[pdf]'\n"
+            "hi_res table extraction also needs system 'poppler' and 'tesseract-ocr'."
+        ) from e
+
+    elements = partition_pdf(
+        filename=str(path),
+        strategy=CFG.unstructured_strategy,
+        infer_table_structure=CFG.unstructured_infer_tables,
+    )
+
+    sections: list[Section] = []
+    tables: list[Table] = []
+    cur_title: str | None = None
+    buf: list[str] = []
+
+    def flush() -> None:
+        nonlocal buf
+        if buf:
+            body = "\n\n".join(buf).replace("\x00", "")
+            if body.strip():
+                sections.append(Section(title=cur_title, text=body))
+        buf = []
+
+    for el in elements:
+        category = getattr(el, "category", None) or type(el).__name__
+        meta = getattr(el, "metadata", None)
+        text = (getattr(el, "text", "") or "").strip()
+        page = getattr(meta, "page_number", None)
+
+        if category == "Table":
+            html = getattr(meta, "text_as_html", None)
+            if text or html:
+                tables.append(
+                    Table(
+                        text=text.replace("\x00", ""),
+                        html=html,
+                        section=cur_title,
+                        page=page,
+                    )
+                )
+        elif category == "Title":
+            # Heading → close the current section and start a new one.
+            flush()
+            if text:
+                cur_title = text
+        elif category in _UNSTRUCTURED_NOISE:
+            continue
+        elif text:
+            buf.append(text)
+    flush()
+
+    # If unstructured surfaced nothing usable, fall back so the doc still ingests.
+    if not sections and not tables:
+        sections = [Section(title=None, text=pdf_to_text(path))]
+    return sections, tables

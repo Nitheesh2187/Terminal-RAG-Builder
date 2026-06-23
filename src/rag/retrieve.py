@@ -39,7 +39,8 @@ def hybrid_search(
 
     with stage(rec, "rrf_fuse"):
         # Row layout (from db.dense_search / db.sparse_search):
-        #   [0] id, [1] doc_id, [2] chunk_idx, [3] content, [4] title, [5] section, [6] score
+        #   [0] id, [1] doc_id, [2] chunk_idx, [3] content, [4] title, [5] section,
+        #   [6] score, [7] element_type
         dense_rank = {row[0]: i + 1 for i, row in enumerate(dense_rows)}
         dense_score = {row[0]: row[6] for row in dense_rows}
         sparse_rank = {row[0]: i + 1 for i, row in enumerate(sparse_rows)}
@@ -71,6 +72,7 @@ def hybrid_search(
                 content=row[3],
                 title=row[4],
                 section=row[5],
+                element_type=row[7],
                 dense_rank=dense_rank.get(cid),
                 sparse_rank=sparse_rank.get(cid),
                 dense_score=dense_score.get(cid),
@@ -108,6 +110,8 @@ def render_hits(hits: list[Hit], *, max_chars: int = 220) -> None:
     table.add_column("snippet", style="dim", max_width=46, overflow="ellipsis")
     for i, h in enumerate(hits, 1):
         snippet = h.content.replace("\n", " ")[:max_chars]
+        if h.element_type == "table":
+            snippet = "[table] " + snippet
         row = [
             str(i),
             h.doc_id,

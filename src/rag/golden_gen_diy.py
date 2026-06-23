@@ -26,6 +26,18 @@ Usage:
 
     # Append more questions about whatever docs are already in the golden
     python -m rag.golden_gen_diy --n 20
+
+    # Use the local Ollama model instead of Groq
+    python -m rag.golden_gen_diy --n 30 --num-docs 5 --provider ollama
+
+    # Override the model, and chunk source PDFs section-aware at 1200 tokens
+    python -m rag.golden_gen_diy --n 30 --num-docs 5 \
+        --provider ollama --model llama3.1:8b \
+        --chunk-strategy section --chunk-tokens 1200
+
+LLM backend (--provider) and chunking (--chunk-strategy / --chunk-tokens /
+--chunk-overlap) default to the values in .env (LLM_PROVIDER, CHUNK_STRATEGY,
+CHUNK_TOKENS, CHUNK_OVERLAP).
 """
 from __future__ import annotations
 
@@ -46,9 +58,9 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from .chunking import chunk_text
+from .chunking import chunk_sections, chunk_text, chunk_unstructured
 from .config import CFG
-from .pdf import pdf_to_text
+from .pdf import pdf_to_sections, pdf_to_text, pdf_to_unstructured
 
 console = Console()
 
@@ -91,10 +103,36 @@ QUESTION_TYPES = [
 ]
 
 
-def _client() -> OpenAI:
-    if not CFG.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY not set in .env")
-    return OpenAI(api_key=CFG.groq_api_key, base_url=CFG.groq_base_url)
+def _client(provider: str, model: str | None = None) -> tuple[OpenAI, str]:
+    """Build an OpenAI-compatible client + resolved model name for `provider`.
+
+    "groq"   → Groq cloud (needs GROQ_API_KEY).
+    "ollama" → local Ollama OpenAI-compatible endpoint (no key needed).
+    `model` overrides the provider's configured default when given.
+    """
+    provider = provider.lower()
+    if provider == "ollama":
+        # Ollama ignores the key but the OpenAI SDK requires a non-empty one.
+        client = OpenAI(api_key="ollama", base_url=CFG.ollama_base_url)
+        return client, (model or CFG.ollama_model)
+    if provider == "groq":
+        if not CFG.groq_api_key:
+            raise RuntimeError("GROQ_API_KEY not set in .env")
+        client = OpenAI(api_key=CFG.groq_api_key, base_url=CFG.groq_base_url)
+        return client, (model or CFG.groq_model)
+    raise RuntimeError(f"unknown provider {provider!r} (expected 'groq' or 'ollama')")
+
+
+def _chunks_for_pdf(pdf: Path, strategy: str, max_tokens: int, overlap: int):
+    """Parse + chunk a PDF with the chosen strategy; always returns list[Chunk]."""
+    if strategy == "unstructured":
+        sections, tables = pdf_to_unstructured(pdf)
+        return chunk_unstructured(sections, tables, max_tokens=max_tokens, overlap=overlap)
+    if strategy == "section":
+        sections = pdf_to_sections(pdf)
+        return chunk_sections(sections, max_tokens=max_tokens, overlap=overlap)
+    text = pdf_to_text(pdf)
+    return chunk_text(text, max_tokens=max_tokens, overlap=overlap)
 
 
 def _normalize(s: str) -> str:
@@ -120,6 +158,7 @@ def _strip_json_fences(text: str) -> str:
 
 def _generate_one(
     client: OpenAI,
+    model: str,
     doc_id: str,
     chunk_text: str,
     type_hint: str,
@@ -135,7 +174,7 @@ def _generate_one(
     for attempt in range(retries + 1):
         try:
             resp = client.chat.completions.create(
-                model=CFG.groq_model,
+                model=model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -216,6 +255,18 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--delay", type=float, default=0.6,
                    help="Seconds between calls (rate-limit cushion).")
+    p.add_argument("--provider", choices=["groq", "ollama"], default=CFG.llm_provider,
+                   help="LLM backend. Default: LLM_PROVIDER env (groq).")
+    p.add_argument("--model", default=None,
+                   help="Model name override. Default: the provider's configured "
+                        "model (GROQ_MODEL / OLLAMA_MODEL).")
+    p.add_argument("--chunk-strategy", choices=["section", "recursive", "unstructured"],
+                   default=CFG.chunk_strategy,
+                   help="How to parse + chunk source PDFs. Default: CHUNK_STRATEGY env.")
+    p.add_argument("--chunk-tokens", type=int, default=CFG.chunk_tokens,
+                   help="Max tokens per chunk. Default: CHUNK_TOKENS env.")
+    p.add_argument("--chunk-overlap", type=int, default=CFG.chunk_overlap,
+                   help="Token overlap between chunks. Default: CHUNK_OVERLAP env.")
     args = p.parse_args()
 
     output = Path(args.output) if args.output else CFG.golden_path
@@ -270,7 +321,12 @@ def main() -> int:
     console.print(f"[cyan]existing[/cyan]: {len(existing)} questions in {output.name}")
 
     rng = random.Random(args.seed)
-    client = _client()
+    client, model = _client(args.provider, args.model)
+    console.print(f"[cyan]llm[/cyan]: {args.provider} · {model}")
+    console.print(
+        f"[cyan]chunking[/cyan]: {args.chunk_strategy} · {args.chunk_tokens} tok "
+        f"/ {args.chunk_overlap} overlap"
+    )
     new_items: list[dict] = []
     n_calls = n_fail = n_dup = 0
 
@@ -290,11 +346,12 @@ def main() -> int:
                 console.print(f"[yellow]no pdf for {doc_id}[/yellow]")
                 continue
             try:
-                text = pdf_to_text(pdf)
+                chunks = _chunks_for_pdf(
+                    pdf, args.chunk_strategy, args.chunk_tokens, args.chunk_overlap
+                )
             except Exception as e:
                 console.print(f"[yellow]parse fail {doc_id}: {e}[/yellow]")
                 continue
-            chunks = chunk_text(text, max_tokens=CFG.chunk_tokens, overlap=CFG.chunk_overlap)
             if not chunks:
                 continue
             # Skip first chunk (often boilerplate/abstract) and last (refs/appendix)
@@ -305,7 +362,7 @@ def main() -> int:
                     break
                 type_hint = rng.choice(QUESTION_TYPES)
                 n_calls += 1
-                res = _generate_one(client, doc_id, ch.text, type_hint)
+                res = _generate_one(client, model, doc_id, ch.text, type_hint)
                 if not res:
                     n_fail += 1
                     time.sleep(args.delay)
@@ -325,7 +382,10 @@ def main() -> int:
                 time.sleep(args.delay)
 
     if not new_items:
-        console.print("[red]no questions generated — check Groq key, rate limits, or chunk content[/red]")
+        console.print(
+            f"[red]no questions generated — check the {args.provider} endpoint/model, "
+            "rate limits, or chunk content[/red]"
+        )
         return 1
 
     # Always append; create dir + file if missing.
